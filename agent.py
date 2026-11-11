@@ -29,6 +29,7 @@ def run_agent(question, provider, tools, max_steps=6):
 
     trace = []
     usage = []
+    observed_source_urls = []
 
     for step in range(1, max_steps + 1):
         # Lỗi provider kết thúc run vì không thể tiếp tục gọi model.
@@ -105,6 +106,16 @@ def run_agent(question, provider, tools, max_steps=6):
                     'result': result,
                 })
 
+                if isinstance(result, dict) and result.get('ok') is True:
+                    source_url = result.get('url')
+
+                    if (
+                        isinstance(source_url, str)
+                        and source_url
+                        and source_url not in observed_source_urls
+                    ):
+                        observed_source_urls.append(source_url)
+
                 messages.append({
                     'role': 'tool',
                     'tool_call_id': call.get('id'),
@@ -120,6 +131,34 @@ def run_agent(question, provider, tools, max_steps=6):
         answer = message.get('content') or ''
 
         if finish == 'stop':
+            missing_source_urls = [
+                url for url in observed_source_urls
+                if url not in answer
+            ]
+
+            if missing_source_urls:
+                trace.append({
+                    'event': 'validation_missing_source',
+                    'step': step,
+                    'missing_urls': missing_source_urls,
+                })
+
+                if step < max_steps:
+                    messages.append({
+                        'role': 'user',
+                        'content': (
+                            'Câu trả lời trước thiếu URL nguồn đã '
+                            'quan sát từ tool thành công. Hãy viết lại '
+                            'câu trả lời và dẫn đủ các URL sau: '
+                            + ', '.join(missing_source_urls)
+                        ),
+                    })
+                    continue
+
+                # Hết budget: để vòng lặp kết thúc bằng max_steps,
+                # không báo completed cho câu trả lời thiếu nguồn.
+                continue
+
             return {
                 'status': 'completed',
                 'answer': answer,

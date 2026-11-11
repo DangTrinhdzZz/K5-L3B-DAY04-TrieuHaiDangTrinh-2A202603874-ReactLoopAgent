@@ -1,8 +1,19 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
+import uuid
+
+
+OPENROUTER_MIN_INTERVAL_SECONDS = 3.2
+MAX_HTTP_ATTEMPTS = 4
+MAX_EMPTY_RESPONSE_RETRIES = 3
+
+_request_pacing_lock = threading.Lock()
+_last_request_started_at = 0.0
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
@@ -12,16 +23,86 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+def _pace_request(min_interval):
+    """Serialize request starts so concurrent callers also respect the limit."""
+    global _last_request_started_at
+
+    if min_interval <= 0:
+        return
+
+    with _request_pacing_lock:
+        elapsed = time.monotonic() - _last_request_started_at
+        remaining = min_interval - elapsed
+
+        if remaining > 0:
+            time.sleep(remaining)
+
+        _last_request_started_at = time.monotonic()
+
+
+def _retry_after_seconds(exc, attempt):
+    """Return a bounded delay without exposing the provider response body."""
+    retry_after = exc.headers.get('Retry-After') if exc.headers else None
+
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+        requested_delay = float(retry_after)
+    except (TypeError, ValueError):
+        requested_delay = 0.0
+
+    exponential_delay = 5.0 * (2 ** attempt)
+    return min(60.0, max(exponential_delay, requested_delay))
+
+
+def post_json(url, headers, payload, min_interval=0.0):
+    for attempt in range(MAX_HTTP_ATTEMPTS):
+        _pace_request(min_interval)
+
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                'Content-Type': 'application/json',
+                **headers,
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return json.load(response)
+
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < MAX_HTTP_ATTEMPTS - 1:
+                wait_seconds = _retry_after_seconds(exc, attempt)
+                print(
+                    f'Rate limit 429; retrying in {wait_seconds:g}s...'
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            raise RuntimeError(
+                f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.'
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError('Không kết nối được provider.') from exc
+
+
+def _assistant_message_is_empty(data):
+    """A refusal or tool call is meaningful even when content is empty."""
+    try:
+        message = data['choices'][0]['message']
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError('Provider trả response không hợp lệ.') from exc
+
+    if not isinstance(message, dict):
+        raise RuntimeError('Provider trả assistant message không hợp lệ.')
+
+    content = message.get('content')
+    has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
+    return not (
+        has_content
+        or message.get('tool_calls')
+        or message.get('refusal')
+    )
 
 
 class Provider:
@@ -36,9 +117,24 @@ class Provider:
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
+        self.session_id = str(uuid.uuid4())
+
         key_name, default_url = CONFIG[name]
-        self.url = os.getenv('API_ENDPOINT', default_url)
+        custom_endpoint = os.getenv('API_ENDPOINT')
+
+        self.url = custom_endpoint or default_url
+
+        if self.url.rstrip('/').endswith('/v1'):
+            self.url = self.url.rstrip('/') + '/chat/completions'
+
+        if 'opencode.ai' in self.url:
+            key_name = 'OPENCODE_GO_API_KEY'
+
         self.key = os.getenv(key_name)
+
+        if self.key:
+            self.key = self.key.strip()
+
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
 
@@ -51,17 +147,44 @@ class Provider:
             'messages': messages,
         }
 
-        if self.name == 'openai' and self.model == 'gpt-6-luna':
+        if self.model in ('gpt-6-luna', 'openai/gpt-6-luna'):
             payload['reasoning_effort'] = 'none'
 
         if schemas:
             payload['tools'] = schemas
 
-        data = post_json(
-            self.url,
-            {'Authorization': f'Bearer {self.key}'},
-            payload,
+        headers = {
+            'Authorization': f'Bearer {self.key}',
+        }
+
+        if 'opencode.ai' in self.url:
+            headers['User-Agent'] = 'StatusAgentLab/1.0'
+            headers['x-opencode-session'] = self.session_id
+
+        min_interval = (
+            OPENROUTER_MIN_INTERVAL_SECONDS
+            if self.name == 'openrouter'
+            else 0.0
         )
+
+        for empty_retry in range(MAX_EMPTY_RESPONSE_RETRIES + 1):
+            data = post_json(
+                self.url,
+                headers,
+                payload,
+                min_interval,
+            )
+
+            if not _assistant_message_is_empty(data):
+                break
+
+            if empty_retry == MAX_EMPTY_RESPONSE_RETRIES:
+                raise RuntimeError(
+                    'Provider trả assistant message rỗng sau nhiều lần thử.'
+                )
+
+            print('Empty assistant message; retrying...')
+
         choice = data['choices'][0]
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
