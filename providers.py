@@ -36,7 +36,8 @@ class Provider:
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
-        key_name, self.url = CONFIG[name]
+        key_name, default_url = CONFIG[name]
+        self.url = os.getenv('API_ENDPOINT', default_url)
         self.key = os.getenv(key_name)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
@@ -44,10 +45,23 @@ class Provider:
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
-        payload = {'model': self.model, 'messages': messages}
+
+        payload = {
+            'model': self.model,
+            'messages': messages,
+        }
+
+        if self.name == 'openai' and self.model == 'gpt-6-luna':
+            payload['reasoning_effort'] = 'none'
+
         if schemas:
             payload['tools'] = schemas
-        data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+
+        data = post_json(
+            self.url,
+            {'Authorization': f'Bearer {self.key}'},
+            payload,
+        )
         choice = data['choices'][0]
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
